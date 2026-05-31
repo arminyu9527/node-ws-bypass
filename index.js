@@ -1,156 +1,180 @@
-const express = require('express');
-
-const { connect } = require('net');
-
+const http = require('node:http');
+const { connect } = require('node:net');
+const { spawn } = require('node:child_process');
+const fs = require('node:fs');
 const { Server, createWebSocketStream } = require('ws');
-
 const { bin, install } = require('cloudflared');
 
-const { spawn } = require('node:child_process');
+const textDecoder = new TextDecoder();
+const redirectLocation = 'https://newsnow.busiyi.world/';
+const handshakeTimeoutMs = 10000;
+const connectTimeoutMs = 15000;
 
-const fs = require('node:fs');
+function parseTarget(msg, offset) {
+  if (msg.length < offset + 3) return null;
 
-const server = 'bexnxx.nyc.mn'
+  const port = msg.readUInt16BE(offset);
+  offset += 2;
 
-const app = express();
+  const addressType = msg[offset++];
+  let host;
 
+  if (addressType === 1) {
+    if (msg.length < offset + 4) return null;
+    host = `${msg[offset]}.${msg[offset + 1]}.${msg[offset + 2]}.${msg[offset + 3]}`;
+    offset += 4;
+  } else if (addressType === 2) {
+    const length = msg[offset++];
+    if (!length || msg.length < offset + length) return null;
+    host = textDecoder.decode(msg.subarray(offset, offset + length));
+    offset += length;
+  } else if (addressType === 3) {
+    if (msg.length < offset + 16) return null;
 
-const uuidv4 = () => 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c =>
+    const parts = new Array(8);
+    for (let i = 0; i < 8; i += 1) {
+      parts[i] = msg.readUInt16BE(offset + (i * 2)).toString(16);
+    }
 
-  ((Math.random() * 16) | 0).toString(16)
-
-);
-
-
-function run(config) {
-
-  if (!config.port) {
-
-    console.error('port?')
-
-    return
-
+    host = parts.join(':');
+    offset += 16;
+  } else {
+    return null;
   }
 
-  app.get('*', (req, res) => {
+  return { host, port, offset };
+}
 
-    //res.setHeader('Content-Type', 'text/plain');
-    res.redirect(`https://newsnow.busiyi.world/`);
+function startTunnel(token) {
+  const args = ['tunnel', '--protocol', 'http2', 'run', '--token', token];
 
-    //     res.send(`TLS: vless://${config.uuid ? config.uuid : uuidv4()}@${server}:443?encryption=none&security=tls&sni=${server}&fp=randomized&type=ws&host=${server}&path=${encodeURIComponent('/' + btoa(`${req.protocol}://${req.headers.host}${config.path ? config.path : "/"}`))}#vless+ws+tls
+  if (!fs.existsSync(bin)) {
+    install(bin).then(() => {
+      console.log('installed tunnel');
+      spawn(bin, args, { stdio: 'inherit' });
+    }).catch(error => {
+      console.log('tunnel install failed', error);
+    });
 
+    return;
+  }
 
-    // NONTLS: vless://${config.uuid ? config.uuid : uuidv4()}@${server}:80?path=${encodeURIComponent('/' + btoa(`${req.protocol}://${req.headers.host}${config.path ? config.path : "/"}`))}&security=none&encryption=none&host=${server}&fp=randomized&type=ws&sni=${server}#vless+ws+nontls`);
+  spawn(bin, args, { stdio: 'inherit' });
+}
 
+function run(config) {
+  if (!config.port) {
+    console.error('port?');
+    return;
+  }
+
+  const expectedUuid = config.uuid ? config.uuid.replace(/-/g, '').toLowerCase() : null;
+
+  const httpServer = http.createServer((req, res) => {
+    res.writeHead(302, { Location: redirectLocation });
+    res.end();
   });
 
-
-  const httpServer = app.listen(config.port, () => {
-
+  httpServer.listen(config.port, () => {
     console.log(`Server running on http://localhost:${config.port}`);
 
     if (config.token) {
-      console.log(`starting tuunel...`);
-
-      if (!fs.existsSync(bin)) {
-        // install cloudflared binary
-        install(bin).then(result => {
-          console.log('installed tuunel');
-          spawn(bin, ["tunnel", "--protocol", "http2", "run", "--token", config.token], { stdio: "inherit" });
-        }).catch(error => {
-          console.log('tuunel installed failed', error);
-        });
-
-      } else {
-        spawn(bin, ["tunnel", "--protocol", "http2", "run", "--token", config.token], { stdio: "inherit" });
-      }
-
-
+      console.log('starting tunnel...');
+      startTunnel(config.token);
     }
   });
-
-
-
 
   const wss = new Server({ noServer: true, path: config.path || null });
 
+  wss.on('connection', ws => {
+    const handshakeTimer = setTimeout(() => {
+      ws.close();
+    }, handshakeTimeoutMs);
 
-  wss.on('connection', (ws) => {
+    ws.once('message', msg => {
+      clearTimeout(handshakeTimer);
 
-    ws.once('message', (msg) => {
+      if (!Buffer.isBuffer(msg)) msg = Buffer.from(msg);
 
-      const [version] = msg;
+      if (msg.length < 19) {
+        ws.close();
+        return;
+      }
 
-      const id = msg.subarray(1, 17).toString('hex');
+      const version = msg[0];
 
-      if (config.uuid && (id !== config.uuid.replace(/-/g, ''))) return;
+      if (expectedUuid && msg.subarray(1, 17).toString('hex') !== expectedUuid) {
+        ws.close();
+        return;
+      }
 
-      let offset = msg.readUInt8(17) + 19;
+      const target = parseTarget(msg, msg[17] + 19);
 
-      const targetPort = msg.readUInt16BE(offset);
+      if (!target) {
+        ws.close();
+        return;
+      }
 
-      offset += 2;
-
-      const addressType = msg.readUInt8(offset++);
-
-      const getHost = {
-
-        1: () => Array.from(msg.subarray(offset, offset += 4)).join('.'),
-
-        2: () => new TextDecoder().decode(msg.subarray(offset + 1, offset += 1 + msg[offset])),
-
-        3: () => Array.from(msg.subarray(offset, offset += 16))
-          .map((b, i, arr) => (i % 2 ? arr.slice(i - 1, i + 1) : [])
-            .map(x => x.readUInt16BE(0).toString(16)).join(':')).filter(Boolean).join(':'),
-
-      };
-
-      const targetHost = getHost[addressType] ? getHost[addressType]() : '';
-
-      ws.send(Uint8Array.of(version, 0));
+      ws.send(Buffer.from([version, 0]));
 
       const duplex = createWebSocketStream(ws);
-
-      connect({ host: targetHost, port: targetPort }, function () {
-
-        this.write(msg.subarray(offset));
-
+      const remote = connect({ host: target.host, port: target.port }, function () {
+        this.setTimeout(0);
+        this.setNoDelay(true);
+        this.write(msg.subarray(target.offset));
         duplex.pipe(this).pipe(duplex);
+      });
 
-      }).on('error', () => { });
+      let cleaned = false;
+      const cleanup = () => {
+        if (cleaned) return;
+        cleaned = true;
 
+        ws.removeListener('close', cleanup);
+        duplex.removeListener('error', cleanup);
+        remote.removeListener('error', cleanup);
+        remote.removeListener('timeout', cleanup);
+        remote.removeListener('close', cleanup);
+
+        remote.destroy();
+        duplex.destroy();
+      };
+
+      remote.setTimeout(connectTimeoutMs, cleanup);
+      ws.once('close', cleanup);
+      duplex.once('error', cleanup);
+      remote.once('error', cleanup);
+      remote.once('timeout', cleanup);
+      remote.once('close', cleanup);
     });
 
+    ws.once('close', () => {
+      clearTimeout(handshakeTimer);
+    });
   });
 
   httpServer.on('upgrade', (request, socket, head) => {
-
-    if (request.headers.upgrade.toLowerCase() !== 'websocket') {
-
+    if ((request.headers.upgrade || '').toLowerCase() !== 'websocket') {
       socket.end('HTTP/1.1 400 Bad Request');
-
       return;
-
     }
 
-    wss.handleUpgrade(request, socket, head, (ws) => {
-
+    wss.handleUpgrade(request, socket, head, ws => {
       wss.emit('connection', ws, request);
-
     });
-
   });
-
 }
 
+process.on('uncaughtException', error => {
+  console.log(error);
+});
 
-process.on('uncaughtException', error => { console.log(error) });
-
-process.on('unhandledRejection', error => { console.log(error) });
-
+process.on('unhandledRejection', error => {
+  console.log(error);
+});
 
 run({
   port: process.env.PORT || 8080,
   uuid: process.env.UUID || 'f65c45c4-08c0-49f4-a2bf-aed46e0c008a',
   token: process.env.TOKEN || '',
-})
+});

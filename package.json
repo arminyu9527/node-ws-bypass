@@ -1,38 +1,19 @@
 {
-
   "name": "vls-ws",
-
   "version": "1.0.2",
-
   "description": "web",
-
   "main": "index.js",
-
   "scripts": {
-
     "start": "node index.js"
-
   },
-
   "keywords": [
-
     "websocket",
-
     "nodejs"
   ],
-
   "author": "bexnxx",
-
   "license": "ISC",
-
   "dependencies": {
-
-    "ws": "latest",
-
-    "express": "^4.21.2",
-	
-	  "cloudflared": "latest"
-
+    "cloudflared": "latest",
+    "ws": "latest"
   }
-
 }
